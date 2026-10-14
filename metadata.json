@@ -1,0 +1,6 @@
+{
+  "name": "Nguru EdTech",
+  "description": "AI-powered adaptive learning layer on YouTube. Curate adaptive courses, pinpoint conceptual gaps, calibrate confidence, and build your Learner DNA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
