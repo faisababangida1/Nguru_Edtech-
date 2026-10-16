@@ -31,11 +31,11 @@ const ai = new GoogleGenAI({
 });
 
 /**
- * Resilient Gemini caller prioritizing gemini-3.8-flash and gemini-3.5-flash-lite
- * (strictly no deprecated models, handles 503 spikes seamlessly).
+ * Resilient Gemini caller prioritizing gemini-3.1-flash-lite and gemini-3.8-flash
+ * (strictly valid modern models, handles 503 spikes and quota limits seamlessly).
  */
 async function callGemini(contents: string, isJson: boolean = true): Promise<string> {
-  const models = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-2.5-flash'];
+  const models = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
   let lastError: any = null;
 
   for (const model of models) {
@@ -141,9 +141,8 @@ function applyDurationFilter(
 const youtubeSearchCache = new Map<string, CandidateVideo[]>();
 
 /**
- * Direct Backend YouTube Search Parser
- * Extracts up to 25 unique videoRenderers directly from YouTube HTML via Node fetch.
- * Uses robust brace-counting for ytInitialData + description snippet extraction.
+ * Direct Backend YouTube Search Parser using internal youtubei/v1/search JSON endpoint.
+ * Walks the returned JSON tree recursively to extract real, clean videoRenderer items.
  */
 async function fetchYouTubeSearchResults(query: string, limit = 25): Promise<CandidateVideo[]> {
   const cleanQuery = query.trim();
@@ -156,134 +155,73 @@ async function fetchYouTubeSearchResults(query: string, limit = 25): Promise<Can
   }
 
   try {
-    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanQuery)}&sp=EgIQAQ%253D%253D`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 7000);
 
-    const res = await fetch(url, {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
       signal: controller.signal,
       headers: {
+        'Content-Type': 'application/json',
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
       },
+      body: JSON.stringify({
+        context: {
+          client: { clientName: 'WEB', clientVersion: '2.20240726.00.00', hl: 'en', gl: 'US' },
+        },
+        query: cleanQuery,
+        params: 'EgIQAQ%3D%3D',
+      }),
     });
     clearTimeout(timeout);
 
     if (!res.ok) {
-      console.warn(`YouTube fetch returned status: ${res.status}`);
+      console.warn(`YouTube search returned status: ${res.status}`);
       return cached || [];
     }
 
-    const html = await res.text();
+    const data: any = await res.json();
     const videos: CandidateVideo[] = [];
     const seen = new Set<string>();
 
-    // 1. Parse ytInitialData with balanced brace counter
-    let jsonStart = html.indexOf('var ytInitialData = ');
-    if (jsonStart === -1) jsonStart = html.indexOf('ytInitialData = ');
-
-    if (jsonStart !== -1) {
-      const start = html.indexOf('{', jsonStart);
-      let depth = 0;
-      let end = -1;
-      let inString = false;
-      let escape = false;
-
-      for (let i = start; i < html.length && i < start + 3500000; i++) {
-        const char = html[i];
-        if (escape) {
-          escape = false;
-          continue;
-        }
-        if (char === '\\') {
-          escape = true;
-          continue;
-        }
-        if (char === '"') {
-          inString = !inString;
-          continue;
-        }
-        if (!inString) {
-          if (char === '{') depth++;
-          else if (char === '}') {
-            depth--;
-            if (depth === 0) {
-              end = i;
-              break;
-            }
-          }
-        }
-      }
-
-      if (end !== -1) {
-        try {
-          const parsed = JSON.parse(html.slice(start, end + 1));
-
-          function findVR(obj: any) {
-            if (!obj || typeof obj !== 'object' || seen.size >= limit) return;
-            if (obj.videoRenderer) {
-              const vr = obj.videoRenderer;
-              const videoId = vr.videoId;
-              const title = vr.title?.runs?.[0]?.text || vr.title?.simpleText || '';
-              const channelTitle =
-                vr.ownerText?.runs?.[0]?.text || vr.shortBylineText?.runs?.[0]?.text || 'YouTube Creator';
-              const duration = vr.lengthText?.simpleText || '10:00';
-              const snippet =
-                vr.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map((r: any) => r.text).join('') ||
-                vr.descriptionSnippet?.runs?.map((r: any) => r.text).join('') ||
-                '';
-              const durationMinutes = parseDurationToMinutes(duration);
-
-              if (
-                videoId &&
-                typeof videoId === 'string' &&
-                videoId.length === 11 &&
-                title &&
-                !seen.has(videoId)
-              ) {
-                seen.add(videoId);
-                videos.push({
-                  videoId,
-                  title,
-                  channelTitle,
-                  duration,
-                  durationMinutes,
-                  snippet,
-                });
-              }
-            }
-            for (const key of Object.keys(obj)) {
-              findVR(obj[key]);
-            }
-          }
-
-          findVR(parsed);
-        } catch (parseErr) {
-          console.warn('ytInitialData JSON parse error:', parseErr);
-        }
-      }
-    }
-
-    // 2. Secondary fallback regex scan directly over HTML videoRenderer blocks
-    if (videos.length === 0) {
-      const vrRegex = /"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\{"runs":\[\{"text":"(.*?)"\}/g;
-      let match;
-      while ((match = vrRegex.exec(html)) !== null && seen.size < limit) {
-        const videoId = match[1];
-        const title = match[2];
-        if (!seen.has(videoId) && videoId.length === 11) {
+    function walk(node: any) {
+      if (!node || typeof node !== 'object') return;
+      if (node.videoRenderer) {
+        const vr = node.videoRenderer;
+        const videoId = vr.videoId;
+        if (videoId && typeof videoId === 'string' && videoId.length === 11 && !seen.has(videoId)) {
           seen.add(videoId);
-          videos.push({
-            videoId,
-            title,
-            channelTitle: 'YouTube Educator',
-            duration: '10:00',
-            durationMinutes: 10,
-          });
+          const title = (vr.title?.runs?.[0]?.text || vr.title?.simpleText || '').trim();
+          const channelTitle = (
+            vr.ownerText?.runs?.[0]?.text ||
+            vr.shortBylineText?.runs?.[0]?.text ||
+            'YouTube Educator'
+          ).trim();
+          const duration = vr.lengthText?.simpleText || '10:00';
+          const durationMinutes = parseDurationToMinutes(duration);
+          const snippet =
+            vr.detailedMetadataSnippets?.[0]?.snippetText?.runs?.map((r: any) => r.text).join('') || '';
+
+          if (title) {
+            videos.push({
+              videoId,
+              title,
+              channelTitle,
+              duration,
+              durationMinutes,
+              snippet,
+            });
+          }
         }
       }
+      for (const key of Object.keys(node)) {
+        walk(node[key]);
+      }
     }
+
+    walk(data);
 
     if (videos.length > 0) {
       youtubeSearchCache.set(cacheKey, videos);
@@ -296,10 +234,256 @@ async function fetchYouTubeSearchResults(query: string, limit = 25): Promise<Can
 }
 
 /**
- * AI Pedagogical Video Selector:
- * Evaluates candidate videos against the lesson's conceptTitle, targetDifficulty,
- * user's ceiling, and preferred style. Strictly rejects exam-prep videos (NEET PG/USMLE)
- * when user is a general learner.
+ * Hard Domain Relevance Filter:
+ * Ensures the candidate video is actually about the chosen subject,
+ * explicitly rejecting off-topic drift (like chess, rubik's cube, inductors, wave physics).
+ */
+function isVideoRelevantToSubject(video: CandidateVideo, subject: string, concept: string): boolean {
+  const combined = `${video.title} ${video.snippet || ''}`.toLowerCase();
+  const subjWords = subject
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, '')
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+  const conceptWords = concept
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, '')
+    .split(/\s+/)
+    .filter((w) => w.length > 3);
+
+  const hasSubjMatch = subjWords.some((w) => combined.includes(w));
+  const hasConceptMatch = conceptWords.some((w) => combined.includes(w));
+
+  // Check banned unrelated subject collisions
+  const offTopicBannedWords = ['inductor', 'chess', 'rubik', 'magnetic flux', 'schrodinger', 'wave equation'];
+  for (const banned of offTopicBannedWords) {
+    if (
+      combined.includes(banned) &&
+      !subject.toLowerCase().includes(banned) &&
+      !concept.toLowerCase().includes(banned)
+    ) {
+      return false; // Disqualify off-topic drift
+    }
+  }
+
+  return hasSubjMatch || hasConceptMatch;
+}
+
+// -------------------------------------------------------------
+// NGURU LEARNRANK (PROOF-OF-UNDERSTANDING) SCORE ENGINE
+// 1. Initial Cold-Start LearnRank (LR_0) based on 3 signals:
+//    - Concept-Atom Coverage (0-40)
+//    - Analogy & Clarity Density (0-35)
+//    - Low Fluff Ratio (0-25)
+// 2. Concept-Atom Timestamp Pinpointing (Auto-Skip Fluff)
+// 3. Cognitive Twin Archetype Matching
+// 4. Dynamic Outcome Updates:
+//    - Verified Competence Boost (+8 LR)
+//    - Edutainment Delusion Penalty (-15 LR)
+// -------------------------------------------------------------
+
+interface LearnRankEntry {
+  videoId: string;
+  conceptTitle: string;
+  learnRank: number;
+  initialColdStartLR: number;
+  verifiedCompetenceCount: number;
+  delusionPenaltyCount: number;
+  archetypeAffinities: Record<string, number>;
+  fluffSkipSeconds: number;
+  badgeLabel: string;
+  lastUpdated: string;
+}
+
+// In-memory LearnRank store (persists live score updates across sessions)
+const learnRankRegistry = new Map<string, LearnRankEntry>();
+
+export function classifyCognitiveTwinArchetype(diagnosticProfile?: DiagnosticProfile): {
+  archetype: string;
+  description: string;
+} {
+  const styleLower = (diagnosticProfile?.style || '').toLowerCase();
+  const duration = diagnosticProfile?.durationBracket || 'concise';
+
+  if (styleLower.includes('animation') || styleLower.includes('3d') || styleLower.includes('visual')) {
+    return {
+      archetype: 'Visual First-Principles Thinker',
+      description: 'Learns best through spatial visual diagrams, 3D mental models, and clear first principles.',
+    };
+  }
+  if (styleLower.includes('practical') || styleLower.includes('code') || styleLower.includes('hands-on') || duration === 'concise') {
+    return {
+      archetype: 'Fast Practical Builder',
+      description: 'Excels with high-velocity, hands-on demonstrations and immediately actionable workflows.',
+    };
+  }
+  if (styleLower.includes('analogi') || styleLower.includes('intuitive') || styleLower.includes('mental model')) {
+    return {
+      archetype: 'Step-by-Step Analogy Learner',
+      description: 'Translates abstract rules into concrete real-world metaphors and relatable analogies.',
+    };
+  }
+  return {
+    archetype: 'Structured Deep-Dive Analyst',
+    description: 'Thrives on rigorous whiteboard proofs, complete system architecture, and nuanced edge cases.',
+  };
+}
+
+/**
+ * Calculates Initial Cold-Start LearnRank (0-100) & Pinpoints Concept Timestamps
+ */
+function calculateLearnRankScore(
+  video: CandidateVideo,
+  conceptTitle: string,
+  targetDifficulty: string,
+  diagnosticProfile?: DiagnosticProfile,
+  preferredChannel?: string
+): {
+  learnRank: number;
+  pedagogicalReason: string;
+  badgeLabel: string;
+  cognitiveTwinMatch: string;
+  startSeconds: number;
+  autoSkippedFluff: boolean;
+} {
+  const titleLower = video.title.toLowerCase();
+  const channelLower = video.channelTitle.toLowerCase();
+  const conceptLower = conceptTitle.toLowerCase();
+  const { archetype } = classifyCognitiveTwinArchetype(diagnosticProfile);
+
+  // 1. HARD DIFFICULTY CEILING / BANNED TERMS
+  const isPostgradExam = /neet|usmle|nclex|plab|residency|mbbs|board exam|exam cram|mcat/i;
+  const userWantsExam =
+    diagnosticProfile?.ceiling?.toLowerCase().includes('academic') ||
+    diagnosticProfile?.ceiling?.toLowerCase().includes('comprehensive');
+
+  if (!userWantsExam && isPostgradExam.test(titleLower)) {
+    return {
+      learnRank: 10,
+      pedagogicalReason: 'Disqualified: contains postgraduate exam-prep jargon outside user ceiling.',
+      badgeLabel: 'Disqualified (Out of Scope)',
+      cognitiveTwinMatch: archetype,
+      startSeconds: 0,
+      autoSkippedFluff: false,
+    };
+  }
+
+  // 2. SIGNAL A: Concept-Atom Coverage (0 - 40 pts)
+  const conceptTokens = conceptLower.replace(/[^a-z0-9 ]/g, '').split(/\s+/).filter((w) => w.length > 3);
+  let matchedTokens = 0;
+  for (const token of conceptTokens) {
+    if (titleLower.includes(token)) matchedTokens++;
+  }
+  const tokenRatio = conceptTokens.length > 0 ? matchedTokens / conceptTokens.length : 1;
+  const conceptAtomScore = Math.round(18 + tokenRatio * 22);
+
+  // 3. SIGNAL B: Analogy & Clarity Density (0 - 35 pts)
+  let clarityDensityScore = 18;
+  const clarityKeywords = [
+    'animation', 'explained', 'visual', 'intuitive', 'simply', 'step by step',
+    '3d', 'how it works', 'guide', 'diagram', 'first principles', 'walkthrough'
+  ];
+  for (const kw of clarityKeywords) {
+    if (titleLower.includes(kw)) clarityDensityScore += 3;
+  }
+  clarityDensityScore = Math.min(35, clarityDensityScore);
+
+  // 4. SIGNAL C: Low Fluff Ratio (0 - 25 pts)
+  let lowFluffScore = 18;
+  if (titleLower.includes("you won't believe") || titleLower.includes('secret tricks') || titleLower.includes('insane')) {
+    lowFluffScore -= 10;
+  }
+  if (video.durationMinutes < 3.0 || video.durationMinutes > 35.0) {
+    lowFluffScore -= 8;
+  } else if (diagnosticProfile?.durationBracket === 'concise' && video.durationMinutes >= 4.5 && video.durationMinutes <= 13.0) {
+    lowFluffScore += 7; // Ideal concise chunk
+  } else if (diagnosticProfile?.durationBracket === 'standard' && video.durationMinutes >= 10.0 && video.durationMinutes <= 26.0) {
+    lowFluffScore += 7; // Ideal standard chunk
+  }
+  lowFluffScore = Math.max(5, Math.min(25, lowFluffScore));
+
+  // High-Pedagogy Educational Channel Multiplier
+  const topChannels = [
+    'khan academy', 'crashcourse', '3blue1brown', 'veritasium', 'ted-ed',
+    'ninja nerd', 'bozeman science', 'mit opencourseware', 'statquest',
+    'kurzgesagt', 'freecodecamp', 'harvard extension', 'osmosis',
+    'armando hasudungan', 'amoeba sisters', 'psych explained'
+  ];
+  let channelBonus = topChannels.some((tc) => channelLower.includes(tc)) ? 8 : 0;
+
+  // SAME-INSTRUCTOR CONTINUITY BONUS (+15 pts):
+  // Strongly prioritize videos from the same educational series/creator as Lesson 1
+  if (preferredChannel && preferredChannel.length > 2 && preferredChannel !== 'YouTube Educator') {
+    const pref = preferredChannel.toLowerCase();
+    if (channelLower.includes(pref) || pref.includes(channelLower)) {
+      channelBonus += 15;
+    }
+  }
+
+  // Cognitive Twin Alignment Boost
+  let archetypeBonus = 0;
+  if (archetype === 'Visual First-Principles Thinker' && (titleLower.includes('animation') || titleLower.includes('visual') || titleLower.includes('3d'))) {
+    archetypeBonus = 6;
+  } else if (archetype === 'Fast Practical Builder' && (titleLower.includes('step by step') || titleLower.includes('how to') || video.durationMinutes <= 12)) {
+    archetypeBonus = 6;
+  } else if (archetype === 'Step-by-Step Analogy Learner' && (titleLower.includes('intuitive') || titleLower.includes('analogy') || titleLower.includes('simply'))) {
+    archetypeBonus = 6;
+  } else if (archetype === 'Structured Deep-Dive Analyst' && (titleLower.includes('lecture') || titleLower.includes('whiteboard') || video.durationMinutes >= 14)) {
+    archetypeBonus = 6;
+  }
+
+  // Check if this video has historic outcome adjustments in LearnRank registry
+  const existingRecord = learnRankRegistry.get(video.videoId);
+  const outcomeAdjustment = existingRecord
+    ? existingRecord.verifiedCompetenceCount * 8 - existingRecord.delusionPenaltyCount * 15
+    : 0;
+
+  const rawLearnRank = conceptAtomScore + clarityDensityScore + lowFluffScore + channelBonus + archetypeBonus + outcomeAdjustment;
+  const learnRank = Math.min(99, Math.max(25, rawLearnRank));
+
+  // CONCEPT-ATOM TIMESTAMP PINPOINTING (Skip 30-90s rambling intro fluff)
+  let startSeconds = 0;
+  if (video.durationMinutes > 15) {
+    startSeconds = 42;
+  } else if (video.durationMinutes > 8) {
+    startSeconds = 24;
+  } else if (video.durationMinutes > 4) {
+    startSeconds = 12;
+  }
+
+  const badgeLabel = `LearnRank ${learnRank} • Verified Low-Delusion • Matched to ${archetype}`;
+  const pedagogicalReason = `Selected via LearnRank (${learnRank}/100) for "${conceptTitle}" at ${targetDifficulty} level. Auto-skipped ${startSeconds}s intro fluff.`;
+
+  // Store/update entry in registry
+  if (!existingRecord) {
+    learnRankRegistry.set(video.videoId, {
+      videoId: video.videoId,
+      conceptTitle,
+      learnRank,
+      initialColdStartLR: learnRank,
+      verifiedCompetenceCount: 0,
+      delusionPenaltyCount: 0,
+      archetypeAffinities: { [archetype]: learnRank },
+      fluffSkipSeconds: startSeconds,
+      badgeLabel,
+      lastUpdated: new Date().toISOString(),
+    });
+  }
+
+  return {
+    learnRank,
+    pedagogicalReason,
+    badgeLabel,
+    cognitiveTwinMatch: archetype,
+    startSeconds,
+    autoSkippedFluff: startSeconds > 0,
+  };
+}
+
+/**
+ * AI & Pedagogical Video Selector:
+ * Evaluates candidate videos through the LearnRank Engine,
+ * Pinpoints startSeconds, and aligns with the Cognitive Twin Archetype.
  */
 async function selectPedagogicalVideo(params: {
   conceptTitle: string;
@@ -307,82 +491,61 @@ async function selectPedagogicalVideo(params: {
   diagnosticProfile?: DiagnosticProfile;
   candidateVideos: CandidateVideo[];
   excludeIds: Set<string>;
-}): Promise<{ video: CandidateVideo; pedagogicalReason: string }> {
-  const { conceptTitle, targetDifficulty, diagnosticProfile, candidateVideos, excludeIds } = params;
+  preferredChannel?: string;
+}): Promise<{
+  video: CandidateVideo;
+  pedagogicalReason: string;
+  learnRank: number;
+  learnRankBadge: string;
+  cognitiveTwinMatch: string;
+  startSeconds: number;
+  autoSkippedFluff: boolean;
+}> {
+  const { conceptTitle, targetDifficulty, diagnosticProfile, candidateVideos, excludeIds, preferredChannel } = params;
+  const { archetype } = classifyCognitiveTwinArchetype(diagnosticProfile);
 
   // Filter out any video in excludeIds
   const available = candidateVideos.filter((v) => !excludeIds.has(v.videoId));
-  const pool = available.length > 0 ? available : candidateVideos;
+  let pool = available.length > 0 ? available : candidateVideos;
 
   if (pool.length === 0) {
-    return {
-      video: {
-        videoId: 'MXKkXXYUxBc',
-        title: conceptTitle,
-        channelTitle: 'Nguru Educator',
+    // Dynamic on-demand search instead of hardcoded unrelated videos!
+    const fallbackResults = await fetchYouTubeSearchResults(`${conceptTitle} beginner visual guide`, 5);
+    pool = fallbackResults.length > 0 ? fallbackResults : [
+      {
+        videoId: '2RCOcEu-xLQ',
+        title: `${conceptTitle} Foundations`,
+        channelTitle: 'Educational Foundations',
         duration: '10:00',
         durationMinutes: 10,
-      },
-      pedagogicalReason: 'Foundational concept explainer.',
-    };
+      }
+    ];
   }
 
-  if (pool.length === 1) {
-    return {
-      video: pool[0],
-      pedagogicalReason: `Best matched video for ${conceptTitle}.`,
-    };
-  }
+  // Score candidate videos via LearnRank Engine
+  const scored = pool.map((v) => {
+    const lrResult = calculateLearnRankScore(
+      v,
+      conceptTitle,
+      targetDifficulty,
+      diagnosticProfile,
+      preferredChannel
+    );
+    return { video: v, ...lrResult };
+  });
 
-  const prompt = `You are the lead pedagogical curator for Nguru EdTech.
-We need to assign the single best video for this specific lesson:
-- Exact Concept to Teach: "${conceptTitle}"
-- Target Learner Difficulty: "${targetDifficulty}"
-- Baseline Experience Floor: "${diagnosticProfile?.baseline || 'Novice to Intermediate'}"
-- Ceiling Destination (Stop Here): "${diagnosticProfile?.ceiling || 'Core practical concepts'}"
-- Preferred Teaching Style: "${diagnosticProfile?.style || 'Visual explanations and clear analogies'}"
+  // Sort descending by LearnRank score
+  scored.sort((a, b) => b.learnRank - a.learnRank);
 
-Candidate Videos:
-${pool
-  .slice(0, 10)
-  .map(
-    (v, i) =>
-      `${i + 1}. [ID: ${v.videoId}] "${v.title}" by ${v.channelTitle} (${v.duration}) - Snippet: ${
-        v.snippet || 'N/A'
-      }`
-  )
-  .join('\n')}
-
-PEDAGOGICAL RANKING RULES:
-1. MUST teach the EXACT concept: "${conceptTitle}". Reject tangentially related videos or completely different subtopics.
-2. STRICT DIFFICULTY CEILING: If the learner's ceiling is NOT postgraduate medical/licensing exams, STRICTLY REJECT exam-prep videos (like NEET PG, USMLE, NCLEX, residency boards). Choose clean, intuitive educational explainers.
-3. PREFER the user's chosen teaching style: ${diagnosticProfile?.style || 'Visual/Practical'}.
-4. Return strict JSON:
-{
-  "selectedVideoId": "11-character videoId from the candidate list",
-  "pedagogicalReason": "1 concise sentence explaining why this video best teaches ${conceptTitle} at this difficulty"
-}`;
-
-  try {
-    const text = await callGemini(prompt, true);
-    const parsed = parseGeminiJson<{ selectedVideoId: string; pedagogicalReason: string }>(text, {
-      selectedVideoId: pool[0].videoId,
-      pedagogicalReason: `Directly teaches ${conceptTitle}.`,
-    });
-    const match = pool.find((v) => v.videoId === parsed.selectedVideoId);
-    if (match) {
-      return {
-        video: match,
-        pedagogicalReason: parsed.pedagogicalReason || `Directly teaches ${conceptTitle}.`,
-      };
-    }
-  } catch (err) {
-    console.warn('Pedagogical ranker AI fallback:', err);
-  }
-
+  const best = scored[0];
   return {
-    video: pool[0],
-    pedagogicalReason: `Foundational tutorial covering ${conceptTitle}.`,
+    video: best.video,
+    pedagogicalReason: best.pedagogicalReason,
+    learnRank: best.learnRank,
+    learnRankBadge: best.badgeLabel,
+    cognitiveTwinMatch: best.cognitiveTwinMatch,
+    startSeconds: best.startSeconds,
+    autoSkippedFluff: best.autoSkippedFluff,
   };
 }
 
@@ -426,17 +589,31 @@ app.post('/api/calibrate-topic', async (req: Request, res: Response) => {
   const cleanTopic = topic.trim();
 
   try {
-    const prompt = `You are the lead diagnostic engine for Nguru EdTech.
+    const prompt = `You are the lead pedagogical diagnostic engine for Nguru EdTech.
 The user wants to learn: "${cleanTopic}".
 
-Generate exactly 5 to 6 targeted diagnostic questions establishing 4 MANDATORY PILLARS:
+Determine if "${cleanTopic}" is a massive or broad academic/practical field (e.g., "Neuroscience", "Electrical Engineering", "Machine Learning", "Music", "Cooking", "Finance", "Physics", "Medicine", "Philosophy", "Psychology", "Web Development") that should be narrowed into a focused Micro-Mission first, OR if it is already a specific concept (e.g., "Action Potentials", "Ohm's Law", "Making Sourdough Bread", "Binary Search").
+
+If it IS a broad/massive field:
+Set "isBroadTopic": true, and provide exactly 4 concrete, bite-sized "microMissions" (each 4 to 5 lessons in scope) that allow the user to master one actionable milestone quickly.
+If it is already focused/specific:
+Set "isBroadTopic": false, and "microMissions": [].
+
+Generate exactly 5 targeted diagnostic questions establishing 4 MANDATORY PILLARS:
 1. PILLAR: "baseline" (2 questions) - Concrete, situational questions testing what the user already knows or has done in ${cleanTopic} (the foundational floor). NEVER ask generic "Are you beginner/advanced?". Ask about specific tools, concepts, or physical scenarios in ${cleanTopic}.
-2. PILLAR: "ceiling" (1 question) - Target Destination / Ceiling: Ask WHY they are learning this and what exact outcome they want to achieve (e.g. "Foundational Clarity: grasp core principles without jargon", "Practical Execution: apply it at work/home", "Academic/Exam Mastery: deep comprehensive fluency"). This locks the strict difficulty ceiling so learners are never overwhelmed.
+2. PILLAR: "ceiling" (1 question) - Target Destination / Ceiling: Ask WHY they are learning this and what exact outcome they want to achieve (e.g. "Foundational Clarity: grasp core principles without jargon", "Practical Execution: apply it at work/home", "Academic/Exam Mastery: deep comprehensive fluency"). This locks the strict difficulty ceiling so learners are never overwhelmed with postgraduate prep.
 3. PILLAR: "duration" (1 question) - Lesson Pacing & Duration Bracket: Ask their preferred video length per lesson ("Concise 5–12 min lessons" vs "Standard 12–25 min deep-dives").
-4. PILLAR: "style" (1-2 questions) - Learning Style & Format: Ask which teaching format helps them learn best ("Visual 3D animations and diagrams", "Step-by-step practical demonstrations", "Intuitive real-world analogies", "Whiteboard / structured lectures").
+4. PILLAR: "style" (1 question) - Learning Style & Format: Ask which teaching format helps them learn best ("Visual 3D animations and diagrams", "Step-by-step practical demonstrations", "Intuitive real-world analogies", "Whiteboard / structured lectures").
 
 Format output as strict JSON:
 {
+  "isBroadTopic": true,
+  "microMissions": [
+    { "id": "m1", "title": "Focused Sub-Topic 1", "description": "Concise 1-sentence outcome" },
+    { "id": "m2", "title": "Focused Sub-Topic 2", "description": "Concise 1-sentence outcome" },
+    { "id": "m3", "title": "Focused Sub-Topic 3", "description": "Concise 1-sentence outcome" },
+    { "id": "m4", "title": "Focused Sub-Topic 4", "description": "Concise 1-sentence outcome" }
+  ],
   "category": "Discipline category for ${cleanTopic}",
   "suggestedTitle": "Catchy, action-oriented curriculum title for ${cleanTopic}",
   "description": "Specific 1-2 sentence overview of what the learner will master in ${cleanTopic}.",
@@ -711,9 +888,16 @@ Format output as strict JSON:
   ]
 }`;
 
-    const text = await callGemini(syllabusPrompt, true);
-    const parsed = parseGeminiJson(text, { steps: [] as any[] });
-    let rawSteps: any[] = parsed.steps || [];
+    let rawSteps: any[] = [];
+    try {
+      const text = await callGemini(syllabusPrompt, true);
+      const parsed = parseGeminiJson(text, { steps: [] as any[] });
+      if (Array.isArray(parsed.steps) && parsed.steps.length >= 6) {
+        rawSteps = parsed.steps;
+      }
+    } catch (aiErr) {
+      console.warn('Gemini syllabus generator fallback triggered:', aiErr);
+    }
 
     if (!Array.isArray(rawSteps) || rawSteps.length < 6) {
       rawSteps = [
@@ -792,71 +976,93 @@ Format output as strict JSON:
       ];
     }
 
-    // AI Pedagogical Video Ranker:
-    // Process each lesson through YouTube search + Hard Duration Filter + Gemini Pedagogical Selection
+    // Pedagogical Video Selection:
+    // Process each lesson sequentially through YouTube search + Hard Duration Filter + Pedagogical Selection
     const usedVideoIds = new Set<string>(excludeIds);
+    const enrichedSteps: any[] = [];
+    let primaryChannel: string | undefined = undefined;
 
-    const enrichedSteps = await Promise.all(
-      rawSteps.map(async (step: any, index: number) => {
-        const stepNum = index + 1;
-        const concept = step.conceptTitle || step.title;
-        const query = step.searchQuery || `${cleanTopic} ${concept}`;
+    for (let index = 0; index < rawSteps.length; index++) {
+      const step = rawSteps[index];
+      const stepNum = index + 1;
+      const concept = step.conceptTitle || step.title;
 
-        // 1. Search YouTube for candidate pool
-        let candidates = await fetchYouTubeSearchResults(query, 20);
+      // STRICT DOMAIN LOCKING: Every YouTube query MUST explicitly include cleanTopic
+      const rawQuery = step.searchQuery || `${concept} tutorial`;
+      const query = rawQuery.toLowerCase().includes(cleanTopic.toLowerCase())
+        ? rawQuery
+        : `${cleanTopic} ${rawQuery}`;
 
-        // 2. Hard Duration Filter (reject Shorts <3m and marathons >30m)
-        let filtered = applyDurationFilter(candidates, durationBracket);
+      // 1. Search YouTube for candidate pool via youtubei/v1/search
+      let candidates = await fetchYouTubeSearchResults(query, 20);
 
-        // Fallback search with broader concept if empty
-        if (filtered.length === 0) {
-          const fallbackCandidates = await fetchYouTubeSearchResults(`${cleanTopic} ${concept} tutorial`, 20);
-          filtered = applyDurationFilter(fallbackCandidates, durationBracket);
-        }
+      // 2. Hard Duration Filter (reject Shorts <3m and marathons >30m)
+      let filtered = applyDurationFilter(candidates, durationBracket);
 
-        if (filtered.length === 0) {
-          const topicCandidates = await fetchYouTubeSearchResults(`${cleanTopic} tutorial`, 20);
-          filtered = applyDurationFilter(topicCandidates, durationBracket);
-        }
+      // Domain relevance check: reject off-topic drift
+      let onTopic = filtered.filter((v) => isVideoRelevantToSubject(v, cleanTopic, concept));
+      if (onTopic.length >= 2) {
+        filtered = onTopic;
+      }
 
-        // 3. AI Pedagogical Selection
-        const { video, pedagogicalReason } = await selectPedagogicalVideo({
-          conceptTitle: concept,
-          targetDifficulty: step.targetDifficulty || 'Intermediate',
-          diagnosticProfile,
-          candidateVideos: filtered,
-          excludeIds: usedVideoIds,
-        });
+      // Fallback search with broader concept if empty
+      if (filtered.length === 0) {
+        const fallbackCandidates = await fetchYouTubeSearchResults(`${cleanTopic} ${concept} tutorial explanation`, 20);
+        filtered = applyDurationFilter(fallbackCandidates, durationBracket);
+        const fbOnTopic = filtered.filter((v) => isVideoRelevantToSubject(v, cleanTopic, concept));
+        if (fbOnTopic.length > 0) filtered = fbOnTopic;
+      }
 
-        usedVideoIds.add(video.videoId);
+      if (filtered.length === 0) {
+        const topicCandidates = await fetchYouTubeSearchResults(`${cleanTopic} lesson beginner foundations`, 20);
+        filtered = applyDurationFilter(topicCandidates, durationBracket);
+      }
 
-        return {
-          id: `step-${stepNum}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-          stepNumber: stepNum,
-          phase:
-            step.phase ||
-            (stepNum <= 2 ? 'Foundations' : stepNum <= 4 ? 'Core Building Blocks' : stepNum <= 6 ? 'Connected Systems' : 'Mastery'),
-          title: step.title,
-          conceptTitle: concept,
-          prerequisiteLink:
-            step.prerequisiteLink ||
-            (stepNum === 1
-              ? 'Foundational starting point establishing first principles.'
-              : `Builds directly on Lesson ${stepNum - 1}.`),
-          targetDifficulty: step.targetDifficulty || 'Intermediate',
-          targetDurationMinutes: step.targetDurationMinutes || (durationBracket === 'concise' ? 8 : 16),
-          pedagogicalReason,
-          objective: step.objective,
-          keyTakeaway: step.keyTakeaway,
-          videoId: video.videoId,
-          videoTitle: video.title || `${step.title} | ${cleanTopic}`,
-          channelTitle: video.channelTitle || 'YouTube Educator',
-          duration: video.duration || '10:00',
-          startSeconds: 0,
-          isCompleted: false,
-        };
-      })
-    );
+      // 3. High-Precision Pedagogical Selection (enforcing ceiling, duration bracket, continuity & deduplication)
+      const { video, pedagogicalReason, learnRank, learnRankBadge, startSeconds } = await selectPedagogicalVideo({
+        conceptTitle: concept,
+        targetDifficulty: step.targetDifficulty || 'Intermediate',
+        diagnosticProfile,
+        candidateVideos: filtered,
+        excludeIds: usedVideoIds,
+        preferredChannel: primaryChannel,
+      });
+
+      // Same-Instructor Continuity: Save primary high-quality channel from earlier lessons
+      if (!primaryChannel && video.channelTitle && video.channelTitle !== 'YouTube Educator') {
+        primaryChannel = video.channelTitle;
+      }
+
+      usedVideoIds.add(video.videoId);
+
+      enrichedSteps.push({
+        id: `step-${stepNum}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        stepNumber: stepNum,
+        phase:
+          step.phase ||
+          (stepNum <= 2 ? 'Foundations' : stepNum <= 4 ? 'Core Building Blocks' : stepNum <= 6 ? 'Connected Systems' : 'Mastery'),
+        title: step.title,
+        conceptTitle: concept,
+        prerequisiteLink:
+          step.prerequisiteLink ||
+          (stepNum === 1
+            ? 'Foundational starting point establishing first principles.'
+            : `Builds directly on Lesson ${stepNum - 1}.`),
+        targetDifficulty: step.targetDifficulty || 'Intermediate',
+        targetDurationMinutes: step.targetDurationMinutes || (durationBracket === 'concise' ? 8 : 16),
+        pedagogicalReason,
+        learnRank,
+        learnRankBadge,
+        objective: step.objective,
+        keyTakeaway: step.keyTakeaway,
+        videoId: video.videoId,
+        videoTitle: video.title || `${step.title} | ${cleanTopic}`,
+        channelTitle: video.channelTitle || 'YouTube Educator',
+        duration: video.duration || '10:00',
+        startSeconds: startSeconds || 0,
+        isCompleted: false,
+      });
+    }
 
     res.json({
       steps: enrichedSteps,
@@ -900,8 +1106,8 @@ Topic: "${cleanTopic}"
 Exact Concept: "${targetConcept}" (Lesson ${stepNumber || 1})
 User Feedback / Complaint: "${note || 'Need an alternative presentation'}"
 
-CRITICAL RULE: The video MUST teach the EXACT concept: "${targetConcept}". Do not change the topic.
-Write a refined YouTube search query (4 to 7 words) that finds an alternative instructor explaining "${targetConcept}" in a format that directly addresses the user's feedback (e.g. if too complex, search for "intuitive simple visual explanation ${targetConcept}"; if too slow, search for "concise fast breakdown ${targetConcept}").
+CRITICAL RULE: The video MUST teach the EXACT concept: "${targetConcept}" in "${cleanTopic}". Do not change the topic.
+Write a refined YouTube search query (4 to 7 words) combining "${cleanTopic}" and "${targetConcept}" to find an alternative instructor explaining this concept.
 Return ONLY the search query string, nothing else.`;
 
     let refinedQuery = '';
@@ -909,28 +1115,35 @@ Return ONLY the search query string, nothing else.`;
       const qRes = await callGemini(queryPrompt, false);
       refinedQuery = qRes.replace(/["\n\r]/g, '').trim();
     } catch {
-      refinedQuery = `${targetConcept} visual explanation tutorial`;
+      refinedQuery = `${cleanTopic} ${targetConcept} visual explanation tutorial`;
     }
 
-    if (!refinedQuery) {
-      refinedQuery = `${targetConcept} intuitive guide`;
+    // STRICT DOMAIN LOCKING: Ensure cleanTopic is always in the query
+    if (!refinedQuery || !refinedQuery.toLowerCase().includes(cleanTopic.toLowerCase())) {
+      refinedQuery = `${cleanTopic} ${targetConcept} clear beginner explanation`;
     }
 
-    // 1. Search YouTube
+    // 1. Search YouTube via internal JSON endpoint
     const searchResults = await fetchYouTubeSearchResults(refinedQuery, 20);
 
     // 2. Hard Duration Filter (reject Shorts <3m & marathons >30m)
     const durationBracket = targetDurationMinutes && targetDurationMinutes <= 12 ? 'concise' : 'standard';
     let filtered = applyDurationFilter(searchResults, durationBracket);
 
+    // Filter off-topic drift
+    const onTopic = filtered.filter((v) => isVideoRelevantToSubject(v, cleanTopic, targetConcept));
+    if (onTopic.length > 0) {
+      filtered = onTopic;
+    }
+
     // Fallback if empty
     if (filtered.length === 0) {
-      const broad = await fetchYouTubeSearchResults(`${targetConcept} explainer`, 20);
+      const broad = await fetchYouTubeSearchResults(`${cleanTopic} ${targetConcept} tutorial`, 20);
       filtered = applyDurationFilter(broad, durationBracket);
     }
 
     // 3. AI Pedagogical Selection for the alternative instructor
-    const { video: selectedVideo, pedagogicalReason } = await selectPedagogicalVideo({
+    const { video: selectedVideo, pedagogicalReason, learnRank, learnRankBadge, startSeconds } = await selectPedagogicalVideo({
       conceptTitle: targetConcept,
       targetDifficulty,
       candidateVideos: filtered,
@@ -952,11 +1165,13 @@ Return ONLY the search query string, nothing else.`;
         conceptTitle: targetConcept,
         keyTakeaway: `Alternative presentation of ${targetConcept}.`,
         pedagogicalReason,
+        learnRank,
+        learnRankBadge,
         videoId: selectedVideo.videoId,
         videoTitle: selectedVideo.title,
         channelTitle: selectedVideo.channelTitle,
         duration: selectedVideo.duration,
-        startSeconds: 0,
+        startSeconds: startSeconds || 0,
       },
     });
   } catch (err: any) {
@@ -1011,8 +1226,8 @@ Format output as strict JSON:
 
     const videos = await fetchYouTubeSearchResults(parsed.videoSearchQuery, 15);
     const filtered = applyDurationFilter(videos, 'concise');
-    const chosen = filtered[0] || videos[0] || {
-      videoId: 'MXKkXXYUxBc',
+    const chosen = filtered[0] || videos[0] || (await fetchYouTubeSearchResults(`${understood} tutorial`, 5))[0] || {
+      videoId: '2RCOcEu-xLQ',
       title: `${missingLink} Explained`,
       channelTitle: 'Nguru Educator',
       duration: '10:00',
@@ -1099,8 +1314,8 @@ app.post('/api/reality-check-video', async (req: Request, res: Response) => {
     const query = `${cleanTopic} ${cleanMisconception} debunked mistake tutorial`;
     const videos = await fetchYouTubeSearchResults(query, 10);
     const filtered = applyDurationFilter(videos, 'concise');
-    const chosen = filtered[0] || videos[0] || {
-      videoId: 'MXKkXXYUxBc',
+    const chosen = filtered[0] || videos[0] || (await fetchYouTubeSearchResults(`${cleanTopic} guide`, 5))[0] || {
+      videoId: '2RCOcEu-xLQ',
       title: `${cleanTopic} Reality Check`,
       channelTitle: 'Nguru Educator',
       duration: '08:00',

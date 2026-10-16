@@ -172,6 +172,46 @@ class StorageService {
     });
 
     await this.saveLearnerDNA(dna);
+
+    // Dynamic LearnRank updates for courses matching this topic / mission
+    try {
+      const courses = await this.getCourses();
+      let coursesModified = false;
+      const cleanTopic = topic.toLowerCase().trim();
+
+      courses.forEach((c) => {
+        if (
+          c.topic.toLowerCase().includes(cleanTopic) ||
+          cleanTopic.includes(c.topic.toLowerCase())
+        ) {
+          c.steps.forEach((step) => {
+            if (step.videoId) {
+              const currentLR = step.learnRank ?? 85;
+              if (criticalAnomalies > 0) {
+                // Edutainment Delusion Penalty (-15 LR): User marked high confidence but failed concept
+                const newLR = Math.max(10, currentLR - 15);
+                step.learnRank = newLR;
+                step.learnRankBadge = `LearnRank ${newLR} • High Delusion Flagged • Under Pedagogical Review`;
+                coursesModified = true;
+              } else if (result.percentage >= 80) {
+                // Verified Competence Boost (+8 LR): High accuracy and confidence
+                const newLR = Math.min(100, currentLR + 8);
+                step.learnRank = newLR;
+                step.learnRankBadge = `LearnRank ${newLR} • Verified Low-Delusion • Outcome Proven`;
+                coursesModified = true;
+              }
+            }
+          });
+        }
+      });
+
+      if (coursesModified) {
+        await this.saveCourses(courses);
+      }
+    } catch (e) {
+      console.warn('Failed to update course LearnRank from quiz outcome:', e);
+    }
+
     return dna;
   }
 

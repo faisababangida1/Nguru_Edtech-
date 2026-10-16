@@ -10,15 +10,11 @@ import {
   QuizQuestion,
   RealityCheckVideo,
   SpecificGapResult,
-  DelusionAnomaly
+  DelusionAnomaly,
+  CalibrationResponse
 } from '../types';
 
-export interface CalibrationResponse {
-  category: string;
-  suggestedTitle: string;
-  description: string;
-  questions: CalibrationQuestion[];
-}
+export type { CalibrationResponse };
 
 export interface RoadmapResponse {
   steps: CourseStep[];
@@ -142,6 +138,22 @@ export const apiClient = {
       body: JSON.stringify({ topic, anomalies }),
     });
     if (!res.ok) throw new Error('Failed to prescribe reality check');
+    return res.json();
+  },
+
+  async recordLearnRankOutcome(params: {
+    videoId: string;
+    conceptTitle: string;
+    isCorrect: boolean;
+    confidence: 'guessing' | 'somewhat' | 'confident';
+    archetype?: string;
+  }): Promise<{ updatedRecord: import('../types').LearnRankRecord; deltaLR: number; feedbackSummary: string }> {
+    const res = await fetch('/api/learnrank/outcome', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) throw new Error('Failed to record LearnRank outcome');
     return res.json();
   }
 };

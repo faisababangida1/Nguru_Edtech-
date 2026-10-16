@@ -44,6 +44,9 @@ interface NguruVideoPlayerProps {
   onEnded?: () => void;
   className?: string;
   feedbackBar?: React.ReactNode;
+  learnRank?: number;
+  learnRankBadge?: string;
+  cognitiveTwinMatch?: string;
 }
 
 export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
@@ -56,10 +59,11 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
   onEnded,
   className = '',
   feedbackBar,
+  learnRank,
+  learnRankBadge,
+  cognitiveTwinMatch,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const playerIdRef = useRef<string>(`nguru-yt-${Math.random().toString(36).slice(2, 9)}`);
-  const playerRef = useRef<any>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   const [isStarted, setIsStarted] = useState<boolean>(autoPlay);
@@ -74,23 +78,19 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
   const [showControls, setShowControls] = useState<boolean>(true);
   const [hasEnded, setHasEnded] = useState<boolean>(false);
   const [thumbnailError, setThumbnailError] = useState<boolean>(false);
+  const [showSkipIntroBadge, setShowSkipIntroBadge] = useState<boolean>(false);
 
   const controlsTimeoutRef = useRef<any>(null);
   const progressTimerRef = useRef<any>(null);
 
-  // Load YouTube IFrame API script globally once
+  // Trigger auto-skip intro fluff toast when video starts with startSeconds > 0
   useEffect(() => {
-    if (!window.YT) {
-      const existingScript = document.getElementById('yt-iframe-api-script');
-      if (!existingScript) {
-        const tag = document.createElement('script');
-        tag.id = 'yt-iframe-api-script';
-        tag.src = 'https://www.youtube.com/iframe_api';
-        const firstScriptTag = document.getElementsByTagName('script')[0];
-        firstScriptTag?.parentNode?.insertBefore(tag, firstScriptTag);
-      }
+    if (isStarted && startSeconds > 0) {
+      setShowSkipIntroBadge(true);
+      const timer = setTimeout(() => setShowSkipIntroBadge(false), 5000);
+      return () => clearTimeout(timer);
     }
-  }, []);
+  }, [isStarted, startSeconds]);
 
   // Format seconds to mm:ss
   const formatTime = (secs: number) => {
@@ -100,146 +100,48 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  // Safe command sender (via YT API instance or postMessage fallback)
+  // Safe command sender directly via postMessage to iframe
   const sendCommand = useCallback((func: string, args: any[] = []) => {
-    if (playerRef.current && typeof playerRef.current[func] === 'function') {
+    const iframe = iframeRef.current;
+    if (iframe && iframe.contentWindow) {
       try {
-        playerRef.current[func](...args);
-        return;
-      } catch (err) {
-        console.warn('YT player instance error:', err);
-      }
-    }
-
-    // Fallback: postMessage to iframe directly
-    try {
-      const iframe =
-        iframeRef.current ||
-        (document.getElementById(playerIdRef.current) as HTMLIFrameElement) ||
-        containerRef.current?.querySelector('iframe');
-      if (iframe && iframe.contentWindow) {
         iframe.contentWindow.postMessage(
           JSON.stringify({ event: 'command', func, args }),
           '*'
         );
+      } catch (e) {
+        console.warn('postMessage command warning:', e);
       }
-    } catch (e) {
-      console.warn('postMessage fallback warning:', e);
     }
   }, []);
 
-  // Initialize YT.Player instance
-  const initYTPlayer = useCallback(() => {
-    if (!window.YT || !window.YT.Player) return;
-
-    const el = document.getElementById(playerIdRef.current);
-    if (!el) return;
-
-    if (playerRef.current && typeof playerRef.current.loadVideoById === 'function') {
-      try {
-        playerRef.current.loadVideoById({
-          videoId,
-          startSeconds: Math.floor(startSeconds),
-        });
-        return;
-      } catch {
-        // proceed to rebuild
-      }
-    }
-
-    try {
-      playerRef.current = new window.YT.Player(playerIdRef.current, {
-        videoId,
-        playerVars: {
-          controls: 0,
-          modestbranding: 1,
-          rel: 0,
-          fs: 0,
-          iv_load_policy: 3,
-          disablekb: 1,
-          playsinline: 1,
-          enablejsapi: 1,
-          start: Math.floor(startSeconds),
-          autoplay: isStarted ? 1 : 0,
-          origin: window.location.origin,
-        },
-        events: {
-          onReady: (event: any) => {
-            const dur = event.target.getDuration();
-            if (typeof dur === 'number' && dur > 0) setDuration(dur);
-            if (isStarted) {
-              event.target.playVideo();
-              setIsPlaying(true);
-            }
-          },
-          onStateChange: (event: any) => {
-            // 1 = PLAYING, 2 = PAUSED, 0 = ENDED, 3 = BUFFERING
-            if (event.data === 1) {
-              setIsPlaying(true);
-              setHasEnded(false);
-            } else if (event.data === 2) {
-              setIsPlaying(false);
-            } else if (event.data === 0) {
-              setIsPlaying(false);
-              setHasEnded(true);
-              onEnded?.();
-            }
-          },
-        },
-      });
-    } catch (err) {
-      console.warn('Failed to construct YT.Player:', err);
-    }
-  }, [videoId, startSeconds, isStarted, onEnded]);
-
-  // Setup player on mount or video change
-  useEffect(() => {
-    setIsPlaying(autoPlay);
-    setIsStarted(autoPlay);
-    setCurrentTime(startSeconds);
-    setDuration(0);
-    setHasEnded(false);
-    setThumbnailError(false);
-
-    if (window.YT && window.YT.Player) {
-      initYTPlayer();
-    } else {
-      let attempts = 0;
-      const interval = setInterval(() => {
-        attempts++;
-        if (window.YT && window.YT.Player) {
-          clearInterval(interval);
-          initYTPlayer();
-        } else if (attempts > 30) {
-          clearInterval(interval);
-        }
-      }, 100);
-      return () => clearInterval(interval);
-    }
-  }, [videoId, autoPlay, startSeconds, initYTPlayer]);
-
   // Periodic polling for scrub timeline while playing
   useEffect(() => {
-    if (isPlaying) {
+    if (isPlaying && isStarted) {
       progressTimerRef.current = setInterval(() => {
-        if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
+        const iframe = iframeRef.current;
+        if (iframe && iframe.contentWindow) {
           try {
-            const curr = playerRef.current.getCurrentTime();
-            const dur = playerRef.current.getDuration();
-            if (typeof curr === 'number') setCurrentTime(curr);
-            if (typeof dur === 'number' && dur > 0) setDuration(dur);
+            iframe.contentWindow.postMessage(JSON.stringify({ event: 'listening' }), '*');
           } catch {
             // ignore
           }
         }
+        // Smooth local second advancement if playing
+        setCurrentTime((prev) => {
+          if (duration > 0 && prev >= duration) {
+            return prev;
+          }
+          return prev + 0.35;
+        });
       }, 350);
     }
     return () => {
       if (progressTimerRef.current) clearInterval(progressTimerRef.current);
     };
-  }, [isPlaying]);
+  }, [isPlaying, isStarted, duration]);
 
-  // Listen to postMessage from iframe
+  // Listen to postMessage from iframe for exact YouTube delivery
   useEffect(() => {
     const handleMsg = (event: MessageEvent) => {
       try {
@@ -253,9 +155,14 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
         }
         if (!data || typeof data !== 'object') return;
 
+        // infoDelivery event
         if (data.event === 'infoDelivery' && data.info) {
-          if (typeof data.info.currentTime === 'number') setCurrentTime(data.info.currentTime);
-          if (typeof data.info.duration === 'number' && data.info.duration > 0) setDuration(data.info.duration);
+          if (typeof data.info.currentTime === 'number') {
+            setCurrentTime(data.info.currentTime);
+          }
+          if (typeof data.info.duration === 'number' && data.info.duration > 0) {
+            setDuration(data.info.duration);
+          }
           if (typeof data.info.playerState === 'number') {
             if (data.info.playerState === 1) {
               setIsPlaying(true);
@@ -267,6 +174,21 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
               setHasEnded(true);
               onEnded?.();
             }
+          }
+        }
+
+        // onStateChange event
+        if (data.event === 'onStateChange') {
+          const state = typeof data.info === 'number' ? data.info : data.data;
+          if (state === 1) {
+            setIsPlaying(true);
+            setHasEnded(false);
+          } else if (state === 2) {
+            setIsPlaying(false);
+          } else if (state === 0) {
+            setIsPlaying(false);
+            setHasEnded(true);
+            onEnded?.();
           }
         }
       } catch {
@@ -342,21 +264,42 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
   };
 
   const toggleCinemaMode = () => {
-    setIsCinemaMode((prev) => {
-      const next = !prev;
-      if (!next) setIsLandscapeRotated(false);
-      return next;
-    });
+    if (!isCinemaMode) {
+      setIsCinemaMode(true);
+      setShowControls(true);
+      if (containerRef.current?.requestFullscreen) {
+        containerRef.current.requestFullscreen().catch(() => {});
+      }
+    } else {
+      setIsCinemaMode(false);
+      setIsLandscapeRotated(false);
+      setShowControls(true);
+      if (typeof document !== 'undefined' && document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
   };
 
-  const handleMouseMove = () => {
+  // Fullscreen change listener to sync state with browser
+  useEffect(() => {
+    const handleFsChange = () => {
+      if (typeof document !== 'undefined' && !document.fullscreenElement) {
+        setIsCinemaMode(false);
+        setIsLandscapeRotated(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => document.removeEventListener('fullscreenchange', handleFsChange);
+  }, []);
+
+  const handleUserActivity = () => {
     setShowControls(true);
     if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
     if (isPlaying) {
       controlsTimeoutRef.current = setTimeout(() => {
         setShowControls(false);
         setShowSpeedMenu(false);
-      }, 3500);
+      }, 2500); // 2.5 seconds auto-hide
     }
   };
 
@@ -368,31 +311,37 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
   return (
     <div
       ref={containerRef}
-      onMouseMove={handleMouseMove}
+      onMouseMove={handleUserActivity}
+      onTouchStart={handleUserActivity}
+      onClick={handleUserActivity}
       onMouseLeave={() => {
         if (isPlaying) setShowControls(false);
         setShowSpeedMenu(false);
       }}
       className={`select-none transition-all duration-200 ${
         isCinemaMode
-          ? 'fixed inset-0 z-50 bg-slate-950 flex flex-col justify-between p-3 sm:p-6 overflow-y-auto'
+          ? 'fixed inset-0 z-[9999] bg-black w-screen h-screen m-0 p-0 overflow-hidden flex items-center justify-center'
           : `relative bg-slate-950 rounded-2xl border border-slate-200 shadow-md overflow-hidden ${className}`
       }`}
     >
       {/* 
-        IN-APP CINEMA VIEW HEADER
-        (Clean Nguru branding, Landscape rotation mode toggle, Exit Cinema button)
+        LANDSCAPE / TELEVISION FULLSCREEN OVERLAY HEADER
+        (Minimal floating pill at top, auto-hides after 2.5s)
       */}
       {isCinemaMode && (
-        <div className="w-full max-w-5xl mx-auto flex items-center justify-between pb-3 px-2 text-white shrink-0">
-          <div className="flex items-center gap-2 truncate pr-4">
+        <div
+          className={`absolute top-0 inset-x-0 z-30 flex items-center justify-between p-4 sm:p-6 bg-gradient-to-b from-black/85 via-black/40 to-transparent text-white transition-opacity duration-300 ${
+            showControls || !isPlaying ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+          }`}
+        >
+          <div className="flex items-center gap-3 truncate pr-4">
             <span className="w-2.5 h-2.5 rounded-full bg-[#003380] ring-2 ring-blue-400 animate-pulse shrink-0" />
             <div className="truncate">
-              <h2 className="font-bold text-sm sm:text-base truncate drop-shadow-sm">
+              <h2 className="font-bold text-sm sm:text-base truncate drop-shadow-md">
                 {title}
               </h2>
               {conceptTitle && (
-                <p className="text-xs text-blue-300 truncate">
+                <p className="text-xs text-blue-300 truncate drop-shadow-sm">
                   Concept: {conceptTitle}
                 </p>
               )}
@@ -404,44 +353,42 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
             <button
               type="button"
               onClick={() => setIsLandscapeRotated(!isLandscapeRotated)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold backdrop-blur-sm transition-colors border ${
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold backdrop-blur-md transition-colors border shadow-lg ${
                 isLandscapeRotated
-                  ? 'bg-[#003380] text-white border-blue-400/40 shadow-xs'
-                  : 'bg-white/10 hover:bg-white/20 text-slate-200 border-white/10'
+                  ? 'bg-[#003380] text-white border-blue-400/50'
+                  : 'bg-black/60 hover:bg-black/80 text-slate-200 border-white/20'
               }`}
-              title="Toggle Landscape / Wide Theater Mode"
+              title="Toggle Landscape Rotation"
             >
               <Smartphone className={`w-3.5 h-3.5 transition-transform ${isLandscapeRotated ? 'rotate-90 text-blue-300' : ''}`} />
               <span className="hidden sm:inline">
-                {isLandscapeRotated ? 'Wide View Active' : 'Landscape Mode'}
+                {isLandscapeRotated ? 'Rotated' : 'Rotate'}
               </span>
             </button>
 
-            {/* Exit Cinema Mode */}
+            {/* Exit Fullscreen Mode */}
             <button
               type="button"
               onClick={toggleCinemaMode}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-semibold backdrop-blur-sm transition-colors border border-white/10"
-              title="Exit Cinema Mode (Esc)"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/60 hover:bg-black/80 text-white text-xs font-semibold backdrop-blur-md transition-colors border border-white/20 shadow-lg"
+              title="Exit Fullscreen (Esc)"
             >
               <Minimize2 className="w-4 h-4" />
-              <span className="hidden xs:inline sm:inline">Exit</span>
+              <span>Exit</span>
             </button>
           </div>
         </div>
       )}
 
       {/* 
-        16:9 VIDEO CONTAINER (Masked & Cropped)
-        - aspect-video with overflow-hidden
-        - The YouTube iframe is overscaled and shifted -mt-[60px] to clip all YouTube UI
+        VIDEO CONTAINER (Masked & Cropped)
+        - In Fullscreen: fills 100vw and 100vh without borders or letterbox padding
+        - In Normal View: standard 16:9 aspect-video
       */}
       <div
         className={`relative bg-black flex items-center justify-center overflow-hidden transition-all duration-300 ${
           isCinemaMode
-            ? `w-full max-w-5xl aspect-video max-h-[72vh] mx-auto rounded-2xl shadow-2xl border border-white/10 ${
-                isLandscapeRotated ? 'max-w-6xl max-h-[78vh]' : ''
-              }`
+            ? `w-full h-full ${isLandscapeRotated ? 'rotate-90 scale-90' : ''}`
             : 'w-full aspect-video'
         }`}
       >
@@ -453,9 +400,31 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
           pointer-events-none ensures user never touches YouTube or receives toasts.
         */}
         <div className="absolute inset-0 overflow-hidden flex items-center justify-center pointer-events-none select-none">
-          <div className="w-full h-[calc(100%+120px)] -mt-[60px] pointer-events-none select-none">
-            <div id={playerIdRef.current} className="w-full h-full pointer-events-none" />
-          </div>
+          {isStarted ? (
+            <iframe
+              ref={iframeRef}
+              key={`${videoId}-${startSeconds}`}
+              src={`https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&playsinline=1&controls=0&modestbranding=1&rel=0&iv_load_policy=3&disablekb=1&enablejsapi=1&origin=${encodeURIComponent(typeof window !== 'undefined' ? window.location.origin : '')}`}
+              title={title}
+              allow="autoplay; encrypted-media; fullscreen; picture-in-picture"
+              className="w-full h-[calc(100%+120px)] -mt-[60px] border-0 pointer-events-none select-none"
+              onLoad={() => {
+                try {
+                  iframeRef.current?.contentWindow?.postMessage(JSON.stringify({ event: 'listening' }), '*');
+                  if (startSeconds > 0) {
+                    iframeRef.current?.contentWindow?.postMessage(
+                      JSON.stringify({ event: 'command', func: 'seekTo', args: [startSeconds, true] }),
+                      '*'
+                    );
+                  }
+                } catch {
+                  // ignore
+                }
+              }}
+            />
+          ) : (
+            <div className="w-full h-full bg-black" />
+          )}
         </div>
 
         {/* 
@@ -468,6 +437,17 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
           className="absolute inset-0 z-10 pointer-events-auto cursor-pointer"
           title={isPlaying ? 'Click to Pause' : 'Click to Play'}
         />
+
+        {/* 
+          ⚡ AUTO-SKIPPED INTRO FLUFF FLOATING BADGE
+          Pops up when startSeconds > 0 to notify the learner that rambling preamble was skipped.
+        */}
+        {showSkipIntroBadge && startSeconds > 0 && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-slate-900/95 backdrop-blur-md border border-amber-400/50 text-[11px] sm:text-xs font-bold text-amber-300 shadow-2xl pointer-events-none animate-in fade-in slide-in-from-top-2">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping shrink-0" />
+            <span>⚡ Auto-skipped intro fluff • Starting at key concept</span>
+          </div>
+        )}
 
         {/* 
           3. SLEEK NGURU THUMBNAIL COVER (Visible Before First Tap)
@@ -486,10 +466,17 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
             <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/45 to-slate-950/70" />
 
             {/* Top Badge */}
-            <div className="relative z-10 flex items-center justify-between">
-              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#003380]/90 backdrop-blur-md border border-blue-400/30 text-[11px] font-bold text-white shadow-sm">
-                <ShieldCheck className="w-3.5 h-3.5 text-blue-300" />
-                <span>Nguru Shielded Player</span>
+            <div className="relative z-10 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#003380]/90 backdrop-blur-md border border-blue-400/30 text-[11px] font-bold text-white shadow-sm">
+                  <ShieldCheck className="w-3.5 h-3.5 text-blue-300" />
+                  <span>Nguru Player</span>
+                </div>
+                {learnRank !== undefined && (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-950/90 backdrop-blur-md border border-emerald-400/40 text-[11px] font-black text-emerald-300 shadow-sm">
+                    LearnRank {learnRank}
+                  </span>
+                )}
               </div>
               {channelTitle && (
                 <span className="text-xs text-slate-200 font-medium bg-black/60 backdrop-blur-sm px-2.5 py-1 rounded-lg">
@@ -512,12 +499,24 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
             </div>
 
             {/* Bottom Title Bar */}
-            <div className="relative z-10">
-              {conceptTitle && (
-                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-300 bg-blue-950/70 px-2 py-0.5 rounded border border-blue-400/20 mb-1 inline-block">
-                  {conceptTitle}
-                </span>
-              )}
+            <div className="relative z-10 space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                {conceptTitle && (
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-blue-300 bg-blue-950/70 px-2 py-0.5 rounded border border-blue-400/20">
+                    {conceptTitle}
+                  </span>
+                )}
+                {startSeconds > 0 && (
+                  <span className="text-[10px] font-bold text-amber-300 bg-amber-950/80 px-2 py-0.5 rounded border border-amber-500/30">
+                    ⚡ Auto-skips {startSeconds}s intro
+                  </span>
+                )}
+                {cognitiveTwinMatch && (
+                  <span className="text-[10px] font-medium text-blue-200 bg-blue-900/40 px-2 py-0.5 rounded border border-blue-400/20">
+                    Matched: {cognitiveTwinMatch}
+                  </span>
+                )}
+              </div>
               <h3 className="text-sm sm:text-base font-bold text-white line-clamp-2 drop-shadow-sm">
                 {title}
               </h3>
@@ -587,6 +586,11 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
             </div>
 
             <div className="flex items-center gap-2 shrink-0">
+              {learnRank !== undefined && (
+                <span className="text-[10px] font-black uppercase tracking-wider text-emerald-300 bg-emerald-950/90 px-2 py-0.5 rounded border border-emerald-500/30 shadow-xs">
+                  LR {learnRank}
+                </span>
+              )}
               <span className="text-[10px] font-bold uppercase tracking-wider text-blue-200 bg-[#003380]/70 px-2 py-0.5 rounded border border-blue-400/30">
                 Nguru Player
               </span>
@@ -728,16 +732,6 @@ export const NguruVideoPlayer: React.FC<NguruVideoPlayerProps> = ({
           </div>
         )}
       </div>
-
-      {/* 
-        5. PINNED FEEDBACK BAR IN CINEMA VIEW
-        When expanded to in-app Cinema View, pinned cleanly at the bottom
-      */}
-      {isCinemaMode && feedbackBar && (
-        <div className="w-full max-w-5xl mx-auto pt-4 shrink-0">
-          {feedbackBar}
-        </div>
-      )}
     </div>
   );
 };

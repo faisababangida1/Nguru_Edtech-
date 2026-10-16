@@ -43,6 +43,7 @@ export interface LearnerDNA {
   totalQuizzesTaken: number;
   comprehensionAverage: number; // 0 - 100
   delusionCalibrationScore: number; // 0 - 100 (100 = perfectly calibrated, 0 = high illusion of competence)
+  cognitiveTwinArchetype?: CognitiveTwinArchetype;
   blindSpots: BlindSpot[];
   interactions: VideoInteraction[];
   evolutionLog: Array<{
@@ -51,6 +52,12 @@ export interface LearnerDNA {
     change: string;
     trigger: string;
   }>;
+}
+
+export interface MicroMission {
+  id: string;
+  title: string;
+  description: string;
 }
 
 export interface CalibrationQuestion {
@@ -67,6 +74,25 @@ export interface CourseStepReview {
   timestamp: string;
   adaptiveRerouted?: boolean;
   rerouteReason?: string;
+}
+
+export type CognitiveTwinArchetype =
+  | 'Visual First-Principles Thinker'
+  | 'Fast Practical Builder'
+  | 'Step-by-Step Analogy Learner'
+  | 'Structured Deep-Dive Analyst';
+
+export interface LearnRankRecord {
+  videoId: string;
+  conceptTitle: string;
+  learnRank: number; // 0 - 100
+  initialColdStartLR: number;
+  verifiedCompetenceCount: number;
+  delusionPenaltyCount: number;
+  archetypeAffinities?: Record<string, number>;
+  fluffSkipSeconds: number;
+  badgeLabel: string;
+  lastUpdated: string;
 }
 
 export interface CourseStep {
@@ -86,8 +112,22 @@ export interface CourseStep {
   channelTitle: string;
   duration: string;
   startSeconds?: number;
+  endSeconds?: number;
   isCompleted: boolean;
   review?: CourseStepReview;
+  learnRank?: number;
+  learnRankBadge?: string;
+  cognitiveTwinMatch?: string;
+  autoSkippedFluff?: boolean;
+}
+
+export interface CalibrationResponse {
+  category: string;
+  suggestedTitle: string;
+  description: string;
+  isBroadTopic?: boolean;
+  microMissions?: MicroMission[];
+  questions: CalibrationQuestion[];
 }
 
 export interface DiagnosticProfile {
